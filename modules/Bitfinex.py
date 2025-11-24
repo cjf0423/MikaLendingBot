@@ -260,7 +260,8 @@ class Bitfinex(ExchangeApi):
             "amount": str(amount),
             "rate": str(round(float(lending_rate), 10) * 36500),
             "period": int(duration),
-            "direction": "lend"
+            "direction": "lend",
+            "aff_code": "lzpWIIA_-"
         }
 
         try:
