@@ -21,55 +21,49 @@
 # 127.0.0.1 poloniex.localhost
 # 127.0.0.1 bitfinex.localhost
 
-version: '2'
+version: '2.1'
+
 services:
   nginx:
     image: jwilder/nginx-proxy
-    environment:
-      - VIRTUAL_PORT=8000
-    volumes:
-      - /var/run/docker.sock:/tmp/docker.sock:ro
+    container_name: nginx-proxy
     ports:
       - "80:80"
-
-  poloniex:
-    depends_on:
-      - nginx
-    image: amancevice/pandas:0.23.4-python2
-    restart: always
-    working_dir: /usr/src/app/
-    environment:
-      - API_exchange=poloniex
-      - API_apikey=
-      - API_secret=
-      - VIRTUAL_HOST=poloniex.localhost
-      - VIRTUAL_PROTO=http
-      - BOT_jsonfile=www/botlog.json
-      - BOT_jsonlogsize=200
-      - BOT_startWebServer=true
-    expose:
-    - "8000"
     volumes:
-    - "./:/usr/git-src/"
-    command: bash -c "/usr/git-src/setup-container.sh && pip install -r requirements.txt && python lendingbot.py -cfg default.cfg"
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+    restart: unless-stopped
 
   bitfinex:
+    image: amancevice/pandas:0.23.4-python2
+    container_name: mika-bitfinex
+    restart: always
     depends_on:
       - nginx
-    image: amancevice/pandas:0.23.4-python2
-    restart: always
-    working_dir: /usr/src/app/
+    working_dir: /app
     environment:
-      - API_exchange=bitfinex
-      - API_apikey=
-      - API_secret=
-      - VIRTUAL_HOST=bitfinex.localhost
+      # 只留这四行！全部其他都删掉！
+      - VIRTUAL_HOST=bitfinex.541233945.xyz    # 改成你自己的域名或随便写
+      - VIRTUAL_PORT=8000
       - VIRTUAL_PROTO=http
-      - BOT_jsonfile=www/botlog.json
-      - BOT_jsonlogsize=200
-      - BOT_startWebServer=true
+      # 注意：API 密钥完全靠 default.cfg，不写任何 API_apikey/secret 环境变量！
     expose:
-    - "8000"
+      - "8000"
+    ports:
+      - "8000:8000"          # 加上这行，方便直连调试
     volumes:
-    - "./:/usr/git-src/"
-    command: bash -c "/usr/git-src/setup-container.sh && pip install -r requirements.txt && python lendingbot.py -cfg default.cfg"
+      - .:/app               # 关键：挂载你本地完整项目（含修好的 Bitfinex.py）
+    command: >
+      bash -c "
+        # 彻底禁用官方 setup-container.sh（防止它 git clone 覆盖你修好的代码！）
+        echo 'echo \"Using local fixed code, skip git clone\"' > /app/setup-container.sh &&
+        chmod +x /app/setup-container.sh &&
+        
+        # 修复权限 + 预创建 json（解决 EOF 问题）
+        chmod -R 777 /app/www &&
+        rm -f /app/www/botlog.json &&
+        echo '{\"status\":\"Running\",\"data\":{}}' > /app/www/botlog.json &&
+        
+        # 安装依赖 + 启动（和你本地完全一样，绝不加任何非法参数）
+        pip install -r /app/requirements.txt &&
+        python /app/lendingbot.py -cfg /app/default.cfg
+      "
