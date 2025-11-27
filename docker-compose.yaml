@@ -35,6 +35,7 @@ services:
 
   bitfinex:
     image: amancevice/pandas:0.23.4-python2
+    #image: cjf0423/pandas:0.23.4-python2-arm64
     container_name: mika-bitfinex
     restart: always
     depends_on:
@@ -42,7 +43,7 @@ services:
     working_dir: /app
     environment:
       # 只留这四行！全部其他都删掉！
-      - VIRTUAL_HOST=bitfinex.541233945.xyz    # 改成你自己的域名或随便写
+      - VIRTUAL_HOST=   # 改成你自己的域名或随便写
       - VIRTUAL_PORT=8000
       - VIRTUAL_PROTO=http
       # 注意：API 密钥完全靠 default.cfg，不写任何 API_apikey/secret 环境变量！
