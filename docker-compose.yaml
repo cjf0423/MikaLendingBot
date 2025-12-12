@@ -46,6 +46,7 @@ services:
       - VIRTUAL_HOST=   # 改成你自己的域名或随便写
       - VIRTUAL_PORT=8000
       - VIRTUAL_PROTO=http
+      - TZ=Asia/Shanghai
       # 注意：API 密钥完全靠 default.cfg，不写任何 API_apikey/secret 环境变量！
     expose:
       - "8000"
