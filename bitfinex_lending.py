@@ -11,6 +11,7 @@ Bitfinex 自动放贷脚本
   BFX_FRR_OFFSET     - FRR 偏移值（%/天），例：-0.001 或 0.002，默认 0
   BFX_PERIOD         - 挂单天数（2~120），默认 2
   BFX_RESERVE        - 预留资金 USD，默认 0
+  BFX_REORDER_AMOUNT_THRESHOLD - 金额变化超过此 USD 金额时重挂，默认 1
 """
 
 import hashlib
@@ -38,6 +39,9 @@ API_SECRET     = os.environ.get("BFX_API_SECRET", "")
 FRR_OFFSET     = float(os.environ.get("BFX_FRR_OFFSET", "0"))
 PERIOD         = int(os.environ.get("BFX_PERIOD", "2"))
 RESERVE_AMOUNT = float(os.environ.get("BFX_RESERVE", "0"))
+REORDER_AMOUNT_THRESHOLD = float(
+    os.environ.get("BFX_REORDER_AMOUNT_THRESHOLD", "1")
+)
 
 # ===== 配置区结束 =====
 
@@ -151,7 +155,7 @@ def needs_reorder(active_offers, target_type, target_rate, target_amount, target
         return True, f"类型变更 {ex_type} → {target_type}"
     if ex_period != target_period:
         return True, f"天数变更 {ex_period} → {target_period}"
-    if abs(ex_amount - target_amount) > 1.0:
+    if abs(ex_amount - target_amount) > REORDER_AMOUNT_THRESHOLD:
         return True, f"金额变化 {ex_amount:.2f} → {target_amount:.2f}"
     if target_type == "FRRDELTAVAR":
         if abs(ex_rate - target_rate) < 1e-9:
