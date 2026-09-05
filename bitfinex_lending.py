@@ -12,6 +12,7 @@ Bitfinex 自动放贷脚本
   BFX_PERIOD         - 挂单天数（2~120），默认 2
   BFX_RESERVE        - 预留资金 USD，默认 0
   BFX_REORDER_AMOUNT_THRESHOLD - 金额变化超过此 USD 金额时重挂，默认 1
+  BFX_TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE - true 时将低于金额阈值的未挂出资金转至现货账户，默认 false
 """
 
 import hashlib
@@ -20,6 +21,7 @@ import json
 import os
 import time
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 import requests
 
@@ -41,6 +43,12 @@ PERIOD         = int(os.environ.get("BFX_PERIOD", "2"))
 RESERVE_AMOUNT = float(os.environ.get("BFX_RESERVE", "0"))
 REORDER_AMOUNT_THRESHOLD = float(
     os.environ.get("BFX_REORDER_AMOUNT_THRESHOLD", "1")
+)
+TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE = (
+    os.environ.get("BFX_TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE", "false")
+    .strip()
+    .lower()
+    == "true"
 )
 
 # ===== 配置区结束 =====
@@ -68,8 +76,11 @@ def send_ql_notify(title: str):
 # ─── Bitfinex API ─────────────────────────────────────────────────────────────
 
 def bfx_auth_headers(path: str, body: dict) -> dict:
+    return bfx_auth_headers_for_json(path, json.dumps(body))
+
+
+def bfx_auth_headers_for_json(path: str, body_json: str) -> dict:
     nonce = str(int(time.time() * 1000))
-    body_json = json.dumps(body)
     sig_payload = f"/api{path}{nonce}{body_json}"
     signature = hmac.new(
         API_SECRET.encode("utf-8"),
@@ -98,6 +109,107 @@ def get_wallet_balance(currency: str = "USD") -> float:
         if w[0] == "funding" and w[1] == currency:
             return float(w[4] if w[4] is not None else w[2])
     return 0.0
+
+def get_explicit_funding_available_balance(currency: str = "USD"):
+    """仅返回交易所明确给出的 funding 可用余额；未知时返回 None。"""
+    path = "/v2/auth/r/wallets"
+    headers = bfx_auth_headers(path, {})
+    resp = requests.post(f"{API_BASE}{path}", headers=headers, json={}, timeout=10)
+    resp.raise_for_status()
+    for w in resp.json():
+        if w[0] == "funding" and w[1] == currency:
+            if len(w) > 4 and w[4] is not None:
+                return Decimal(str(w[4]))
+            return None
+    return None
+
+
+def format_transfer_amount(amount: Decimal) -> Decimal:
+    return amount.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+
+def transfer_funding_to_exchange(currency: str, amount: Decimal):
+    """将 funding 钱包中的可用资金划转到 exchange（现货）钱包。"""
+    amount = format_transfer_amount(amount)
+    if amount <= 0:
+        raise ValueError("划转金额必须大于 0")
+
+    path = "/v2/auth/w/transfer"
+    body = {
+        "from": "funding",
+        "to": "exchange",
+        "currency": currency,
+        "amount": format(amount, "f"),
+    }
+    body_json = json.dumps(body)
+    headers = bfx_auth_headers_for_json(path, body_json)
+    resp = requests.post(
+        f"{API_BASE}{path}", headers=headers, data=body_json, timeout=10
+    )
+    resp.raise_for_status()
+
+    result = resp.json()
+    if not isinstance(result, list) or len(result) < 8 or result[6] != "SUCCESS":
+        raise RuntimeError(f"划转未成功：{result}")
+
+    transfer = result[4]
+    if not isinstance(transfer, list) or len(transfer) < 8:
+        raise RuntimeError(f"划转响应格式异常：{result}")
+    if transfer[1] != "funding" or transfer[2] != "exchange":
+        raise RuntimeError(f"划转钱包方向异常：{result}")
+    if transfer[4] != currency or transfer[5] is not None:
+        raise RuntimeError(f"划转币种异常：{result}")
+    if Decimal(str(transfer[7])) != amount:
+        raise RuntimeError(f"划转金额异常：{result}")
+
+    log(f"[划转] 已从 funding 转入现货账户: {amount:.8f} {currency}")
+
+
+def maybe_transfer_small_uncommitted_to_exchange(
+    active_offers, currency: str, target_amount: float
+):
+    """在无需重挂时，将低于阈值的未挂出 funding 余额转入现货账户。"""
+    if not TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE:
+        return None
+    if len(active_offers) != 1:
+        return None
+    if REORDER_AMOUNT_THRESHOLD <= 0:
+        log("[划转] 金额阈值必须大于 0，跳过小额划转")
+        return False
+    if DRY_RUN:
+        log("[DRY RUN] 跳过实际小额划转")
+        return None
+
+    existing_amount = abs(Decimal(str(active_offers[0][4])))
+    amount_delta = Decimal(str(target_amount)) - existing_amount
+    threshold = Decimal(str(REORDER_AMOUNT_THRESHOLD))
+    if not Decimal("0") < amount_delta < threshold:
+        return None
+
+    try:
+        available_balance = get_explicit_funding_available_balance(currency)
+    except Exception as e:
+        log(f"[错误] 获取可用 funding 余额失败，跳过小额划转：{e}")
+        return False
+
+    if available_balance is None:
+        log("[错误] 未取得明确的 funding 可用余额，跳过小额划转")
+        return False
+
+    reserve = Decimal(str(RESERVE_AMOUNT))
+    transferable = min(amount_delta, max(Decimal("0"), available_balance - reserve))
+    transferable = format_transfer_amount(transferable)
+    if transferable <= 0:
+        log("[划转] 扣除预留后没有可划转的未挂出余额")
+        return None
+
+    try:
+        transfer_funding_to_exchange(currency, transferable)
+    except (InvalidOperation, ValueError, requests.RequestException, RuntimeError) as e:
+        log(f"[错误] 小额划转失败：{e}")
+        return False
+    return True
+
 
 def get_active_offers(symbol: str) -> list:
     path = f"/v2/auth/r/funding/offers/{symbol}"
@@ -196,7 +308,11 @@ def main():
 
     log("=" * 50)
     log(f"Bitfinex 自动放贷 | {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    log(f"币种: {SYMBOL} | FRR模式: {USE_FRR} | 天数: {PERIOD} | 预留: {RESERVE_AMOUNT}")
+    log(
+        f"币种: {SYMBOL} | FRR模式: {USE_FRR} | 天数: {PERIOD} | "
+        f"预留: {RESERVE_AMOUNT} | 金额重挂阈值: {REORDER_AMOUNT_THRESHOLD} | "
+        f"小额转现货: {TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE}"
+    )
     log("=" * 50)
 
     # 1. 获取 FRR
@@ -286,7 +402,16 @@ def main():
     log(f"[判断] {'⚡ 需要重挂' if need else '✅ 无需重挂'} — {reason}")
 
     if not need:
-        log("[完成] 现有挂单无变化，跳过")
+        transfer_result = maybe_transfer_small_uncommitted_to_exchange(
+            active_offers, currency, total_available
+        )
+        if transfer_result is False:
+            send_ql_notify("Bitfinex 放贷 ❌")
+            return
+        if transfer_result is True:
+            log("[完成] 保持现有挂单，小额未挂出余额已转入现货账户")
+        else:
+            log("[完成] 现有挂单无变化，跳过")
         send_ql_notify("Bitfinex 放贷 ✅")
         return
 
@@ -332,4 +457,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
