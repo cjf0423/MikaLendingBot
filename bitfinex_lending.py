@@ -13,6 +13,8 @@ Bitfinex 自动放贷脚本
   BFX_RESERVE        - 预留资金 USD，默认 0
   BFX_REORDER_AMOUNT_THRESHOLD - 金额变化超过此 USD 金额时重挂，默认 1
   BFX_TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE - true 时将低于金额阈值的未挂出资金转至现货账户，默认 false
+  BFX_DCA_ENABLED    - true 时在小额划转成功后自动市价买入指定标的，默认 false
+  BFX_DCA_SYMBOL     - 定投标的，如 ETH、BTC，默认空（未设置则不买入）
 """
 
 import hashlib
@@ -50,6 +52,13 @@ TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE = (
     .lower()
     == "true"
 )
+DCA_ENABLED = (
+    os.environ.get("BFX_DCA_ENABLED", "false")
+    .strip()
+    .lower()
+    == "true"
+)
+DCA_SYMBOL = os.environ.get("BFX_DCA_SYMBOL", "").strip().upper()
 
 # ===== 配置区结束 =====
 
@@ -146,7 +155,21 @@ def transfer_funding_to_exchange(currency: str, amount: Decimal):
     resp = requests.post(
         f"{API_BASE}{path}", headers=headers, data=body_json, timeout=10
     )
-    resp.raise_for_status()
+    # [修复 #6] HTTP 非 2xx 时安全记录响应正文后重新抛出，不重试
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        try:
+            body_text = resp.text
+        except Exception as body_error:
+            body_text = f"<unavailable: {body_error}>"
+        limit = 2048
+        suffix = " …[truncated]" if len(body_text) > limit else ""
+        log(
+            f"[错误] 划转 HTTP 响应: "
+            f"status={resp.status_code} body={repr(body_text[:limit] + suffix)}"
+        )
+        raise
 
     result = resp.json()
     if not isinstance(result, list) or len(result) < 8 or result[6] != "SUCCESS":
@@ -163,6 +186,106 @@ def transfer_funding_to_exchange(currency: str, amount: Decimal):
         raise RuntimeError(f"划转金额异常：{result}")
 
     log(f"[划转] 已从 funding 转入现货账户: {amount:.8f} {currency}")
+
+
+def dca_market_buy(target_crypto: str, usd_amount: Decimal):
+    """
+    定投：在现货账户（Exchange）按市价买入指定币种。
+    只花费划转出的 usd_amount，不影响现货账户原有的资金。
+    如果金额太小低于交易所最小交易量，捕获并友好跳过。
+    """
+    if not DCA_ENABLED:
+        return
+    if not target_crypto:
+        log("[定投] 已启用定投但未设置 BFX_DCA_SYMBOL，跳过买入")
+        return
+    if usd_amount <= 0:
+        log("[定投] 划转金额 <= 0，跳过买入")
+        return
+
+    pair = f"t{target_crypto}USD"
+    log(f"[定投] 准备使用划转的 {usd_amount:.4f} USD 市价买入 {target_crypto} (交易对: {pair})")
+
+    if DRY_RUN:
+        log(f"[DRY RUN] 跳过实际定投买入")
+        return
+
+    # 1. 查询当前市价以计算买入数量
+    try:
+        url = f"https://api-pub.bitfinex.com/v2/ticker/{pair}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        ticker = resp.json()
+        # ticker 结构: [BID, BID_SIZE, ASK, ASK_SIZE, DAILY_CHANGE, DAILY_CHANGE_RELATIVE, LAST_PRICE, ...]
+        ask_price = float(ticker[2])  # 用卖一价估算买入数量
+        if ask_price <= 0:
+            ask_price = float(ticker[6])  # 降级到最新成交价
+    except Exception as e:
+        log(f"[定投警告] 获取 {pair} 行情失败，跳过本次定投: {e}")
+        return
+
+    if ask_price <= 0:
+        log(f"[定投警告] 价格异常 ({ask_price})，跳过本次定投")
+        return
+
+    # 2. 计算可购买的基础代币数量 (例如 ETH 数量)
+    # Bitfinex 大多数代币支持 8 位小数，稍微留一点滑点余量 (比如 99.5%) 避免市价单因价格波动导致余额不足
+    est_crypto_amount = (usd_amount * Decimal("0.995")) / Decimal(str(ask_price))
+    # 向下截断到 8 位小数
+    crypto_amount = est_crypto_amount.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+    if crypto_amount <= Decimal("0"):
+        log(f"[定投跳过] 计算出的买入数量过小 ({crypto_amount})，跳过本次定投")
+        return
+
+    log(f"[定投] 当前卖一价 ~{ask_price:.2f} USD，计划买入 {crypto_amount:.8f} {target_crypto} (约 {usd_amount * Decimal('0.995'):.4f} USD)")
+
+    # 3. 提交市价单
+    path = "/v2/auth/w/order/submit"
+    body = {
+        "type": "EXCHANGE MARKET",
+        "symbol": pair,
+        "amount": format(crypto_amount, "f"),  # 正数表示买入
+    }
+    body_json = json.dumps(body)
+    headers = bfx_auth_headers_for_json(path, body_json)
+
+    try:
+        resp = requests.post(
+            f"{API_BASE}{path}", headers=headers, data=body_json, timeout=10
+        )
+        # 即使返回 4xx/500，也解析正文以防是业务拒绝（如 minimum order size）
+        result = None
+        try:
+            result = resp.json()
+        except Exception:
+            pass
+
+        if resp.status_code != 200:
+            err_msg = resp.text[:300]
+            # 常见情况：金额太小，交易所拒绝
+            if "minimum size" in err_msg.lower() or "not enough balance" in err_msg.lower() or "amount" in err_msg.lower():
+                log(f"[定投跳过] 交易所拒绝下单（通常因金额太小低于最小交易量）: {err_msg}")
+                return
+            log(f"[定投警告] 下单失败 HTTP {resp.status_code}: {err_msg}")
+            return
+
+        # 验证 notification
+        notif = result
+        if isinstance(result, list) and len(result) > 0 and isinstance(result[0], list):
+            notif = result[0]
+        if isinstance(notif, list) and len(notif) >= 7:
+            status = notif[6]
+            text = notif[7] if len(notif) > 7 else ""
+            if status == "SUCCESS":
+                log(f"[定投成功] 已成功市价买入 {crypto_amount:.8f} {target_crypto} ✅")
+            else:
+                log(f"[定投跳过] 下单被交易所拒绝 ({status}: {text})，可能是金额太小低于最小限额")
+        else:
+            log(f"[定投] 下单响应: {result}")
+    except Exception as e:
+        log(f"[定投警告] 下单请求异常，跳过本次定投: {e}")
+
 
 
 def maybe_transfer_small_uncommitted_to_exchange(
@@ -208,6 +331,14 @@ def maybe_transfer_small_uncommitted_to_exchange(
     except (InvalidOperation, ValueError, requests.RequestException, RuntimeError) as e:
         log(f"[错误] 小额划转失败：{e}")
         return False
+
+    # 划转成功后，如果启用了定投，则使用划转出来的这笔金额买入指定代币
+    if DCA_ENABLED and DCA_SYMBOL:
+        try:
+            dca_market_buy(DCA_SYMBOL, transferable)
+        except Exception as e:
+            log(f"[定投错误] 定投执行异常（不影响划转结果）：{e}")
+
     return True
 
 
@@ -227,12 +358,27 @@ def get_active_credits(symbol: str) -> list:
     return resp.json()
 
 def cancel_all_funding_offers(symbol: str):
+    """[修复 #3] 撤单后验证 notification 业务状态"""
     path = "/v2/auth/w/funding/offer/cancel/all"
     body = {"currency": symbol.lstrip("f")}
     headers = bfx_auth_headers(path, body)
     resp = requests.post(f"{API_BASE}{path}", headers=headers, json=body, timeout=10)
     resp.raise_for_status()
-    log("[撤单] 已取消所有未成交挂单")
+    result = resp.json()
+    # Bitfinex notification 格式: [MTS, TYPE, MESSAGE_ID, null, null, null, STATUS, TEXT]
+    # 或嵌套在外层数组中
+    notif = result
+    if isinstance(result, list) and len(result) > 0 and isinstance(result[0], list):
+        notif = result[0]
+    if not isinstance(notif, list) or len(notif) < 7:
+        raise RuntimeError(f"撤单响应格式异常，无法确认成功: {result}")
+    notif_type = notif[1] if len(notif) > 1 else None
+    notif_status = notif[6] if len(notif) > 6 else None
+    if notif_type != "foc_all-req" or notif_status != "SUCCESS":
+        raise RuntimeError(
+            f"撤单 notification 未确认成功: type={notif_type} status={notif_status} raw={result}"
+        )
+    log("[撤单] 已取消所有未成交挂单（notification 确认 SUCCESS）")
 
 def calc_target_rate(use_frr, frr_offset, fixed_rate, current_frr):
     MIN_RATE = 0.000001
@@ -279,6 +425,7 @@ def needs_reorder(active_offers, target_type, target_rate, target_amount, target
     return False, f"利率变动 {rate_chg:.4f}%/天 未超阈值，保持现有挂单"
 
 def submit_funding_offer(symbol, amount, period, offer_type, offer_rate, rate_desc):
+    """[修复 #5] 提交后验证 notification 业务状态"""
     path = "/v2/auth/w/funding/offer/submit"
     body = {
         "type": offer_type, "symbol": symbol,
@@ -293,7 +440,20 @@ def submit_funding_offer(symbol, amount, period, offer_type, offer_rate, rate_de
     headers = bfx_auth_headers(path, body)
     resp = requests.post(f"{API_BASE}{path}", headers=headers, json=body, timeout=10)
     resp.raise_for_status()
-    log(f"[结果] 下单成功")
+    result = resp.json()
+    # Bitfinex notification 格式: [MTS, TYPE, MESSAGE_ID, null, OFFER_DATA, null, STATUS, TEXT]
+    notif = result
+    if isinstance(result, list) and len(result) > 0 and isinstance(result[0], list):
+        notif = result[0]
+    if not isinstance(notif, list) or len(notif) < 7:
+        raise RuntimeError(f"下单响应格式异常，无法确认成功: {result}")
+    notif_type = notif[1] if len(notif) > 1 else None
+    notif_status = notif[6] if len(notif) > 6 else None
+    if notif_type != "fon-req" or notif_status != "SUCCESS":
+        raise RuntimeError(
+            f"下单 notification 未确认成功: type={notif_type} status={notif_status} raw={result}"
+        )
+    log(f"[结果] 下单成功（notification 确认 SUCCESS）")
 
 
 # ─── 主流程 ───────────────────────────────────────────────────────────────────
@@ -311,7 +471,8 @@ def main():
     log(
         f"币种: {SYMBOL} | FRR模式: {USE_FRR} | 天数: {PERIOD} | "
         f"预留: {RESERVE_AMOUNT} | 金额重挂阈值: {REORDER_AMOUNT_THRESHOLD} | "
-        f"小额转现货: {TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE}"
+        f"小额转现货: {TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE} | "
+        f"定投: {DCA_ENABLED} (标的: {DCA_SYMBOL or '未设置'})"
     )
     log("=" * 50)
 
@@ -336,15 +497,10 @@ def main():
             total_lent = 0.0
             now_ms = time.time() * 1000
             for c in credits:
-                # credits 结构: [ID, SYMBOL, SIDE, MTS_CREATE, MTS_UPDATE,
-                #                AMOUNT, FLAGS, STATUS, ..., RATE, PERIOD,
-                #                MTS_OPENING, MTS_LAST_PAYOUT, NOTIFY, HIDDEN,
-                #                RENEW, NO_CLOSE, RATE_REAL, NO_CLOSE]
                 amount    = abs(float(c[5]))
-                rate_pct  = float(c[11]) * 100          # 日利率%
-                period    = int(c[12])                   # 总天数
-                mts_open  = float(c[13]) if c[13] else 0 # 开始时间ms
-                # 剩余天数 = 开始时间 + 总天数*86400000 - 现在
+                rate_pct  = float(c[11]) * 100
+                period    = int(c[12])
+                mts_open  = float(c[13]) if c[13] else 0
                 if mts_open > 0:
                     expire_ms    = mts_open + period * 86400 * 1000
                     remain_days  = max(0, (expire_ms - now_ms) / 86400 / 1000)
@@ -376,11 +532,13 @@ def main():
         send_ql_notify("Bitfinex 放贷 ❌")
         return
 
+    # [修复 #1] get_active_offers 失败时记录错误并返回，不伪造空列表
     try:
         active_offers = get_active_offers(SYMBOL)
     except Exception as e:
-        log(f"[警告] 获取挂单失败，默认重挂：{e}")
-        active_offers = []
+        log(f"[错误] 获取挂单失败，无法确定当前状态，停止执行：{e}")
+        send_ql_notify("Bitfinex 放贷 ❌")
+        return
 
     locked_amount  = sum(abs(float(o[4])) for o in active_offers)
     total_available = balance + locked_amount - RESERVE_AMOUNT
@@ -415,14 +573,29 @@ def main():
         send_ql_notify("Bitfinex 放贷 ✅")
         return
 
-    # 6. 撤单
+    # 6. 撤单 — [修复 #2] 任何异常都通知并返回，禁止后续下单
     try:
         cancel_all_funding_offers(SYMBOL)
     except Exception as e:
-        log(f"[警告] 取消挂单失败：{e}")
+        log(f"[错误] 取消挂单失败，停止执行：{e}")
+        send_ql_notify("Bitfinex 放贷 ❌")
+        return
 
     log("[等待] 撤单确认中，等待 5 秒...")
     time.sleep(5)
+
+    # [修复 #4] 撤单后重新读取 active offers，确认已全部撤除
+    try:
+        remaining_offers = get_active_offers(SYMBOL)
+    except Exception as e:
+        log(f"[错误] 撤单后无法确认挂单状态，停止执行：{e}")
+        send_ql_notify("Bitfinex 放贷 ❌")
+        return
+
+    if remaining_offers:
+        log(f"[错误] 撤单后仍有 {len(remaining_offers)} 笔挂单未消失，停止执行")
+        send_ql_notify("Bitfinex 放贷 ❌")
+        return
 
     # 7. 重新查余额
     try:
@@ -437,6 +610,24 @@ def main():
 
     if available < MIN_OFFER_AMOUNT:
         log(f"[跳过] 可放贷金额 {available:.2f} 低于最低限额 {MIN_OFFER_AMOUNT:.2f}")
+        # 金额不够挂单：仅当金额严格小于阈值时转到现货；≥阈值则留着等攒够再放贷
+        if (TRANSFER_SMALL_UNCOMMITTED_TO_EXCHANGE
+                and 0 < available < REORDER_AMOUNT_THRESHOLD
+                and not DRY_RUN):
+            log(f"[划转] 余额 {available:.2f} < 阈值 {REORDER_AMOUNT_THRESHOLD:.2f}，转入现货账户")
+            transfer_amount = format_transfer_amount(Decimal(str(available)))
+            if transfer_amount > 0:
+                try:
+                    transfer_funding_to_exchange(currency, transfer_amount)
+                    if DCA_ENABLED and DCA_SYMBOL:
+                        try:
+                            dca_market_buy(DCA_SYMBOL, transfer_amount)
+                        except Exception as e:
+                            log(f"[定投错误] 定投执行异常（不影响划转结果）：{e}")
+                except (InvalidOperation, ValueError, requests.RequestException, RuntimeError) as e:
+                    log(f"[错误] 小额划转失败：{e}")
+        elif available >= REORDER_AMOUNT_THRESHOLD:
+            log(f"[等待] 余额 {available:.2f} ≥ 阈值 {REORDER_AMOUNT_THRESHOLD:.2f}，保留在 funding 等待攒够放贷")
         send_ql_notify("Bitfinex 放贷 ⚠️")
         return
 
