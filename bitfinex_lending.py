@@ -89,7 +89,7 @@ def bfx_auth_headers(path: str, body: dict) -> dict:
 
 
 def bfx_auth_headers_for_json(path: str, body_json: str) -> dict:
-    nonce = str(int(time.time() * 1000))
+    nonce = str(int(time.time() * 1000000))
     sig_payload = f"/api{path}{nonce}{body_json}"
     signature = hmac.new(
         API_SECRET.encode("utf-8"),
@@ -216,6 +216,9 @@ def dca_market_buy(target_crypto: str, usd_amount: Decimal):
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
         ticker = resp.json()
+        if not isinstance(ticker, list) or len(ticker) < 7:
+            log(f"[定投警告] {pair} 行情数据格式异常 (长度={len(ticker) if isinstance(ticker, list) else 'N/A'})，跳过本次定投")
+            return
         # ticker 结构: [BID, BID_SIZE, ASK, ASK_SIZE, DAILY_CHANGE, DAILY_CHANGE_RELATIVE, LAST_PRICE, ...]
         ask_price = float(ticker[2])  # 用卖一价估算买入数量
         if ask_price <= 0:
@@ -429,8 +432,8 @@ def submit_funding_offer(symbol, amount, period, offer_type, offer_rate, rate_de
     path = "/v2/auth/w/funding/offer/submit"
     body = {
         "type": offer_type, "symbol": symbol,
-        "amount": str(round(amount, 8)),
-        "rate":   str(round(offer_rate, 10)),
+        "amount": str(Decimal(str(amount)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)),
+        "rate":   format(offer_rate, ".10f"),
         "period": period, "flags": 0,
     }
     log(f"[下单] {rate_desc} | 金额={amount:.2f} 天数={period}d")
